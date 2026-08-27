@@ -1,0 +1,30 @@
+version: '3.8'
+
+services:
+  sql-proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: sql-proxy
+    ports:
+      - "3306:3306"
+    volumes:
+      # 挂载配置文件，支持热更新
+      - ./config.yaml:/app/config.yaml
+    environment:
+      # 可选：通过环境变量覆盖配置
+      # - CONFIG_PATH=/app/config.yaml
+      - LOG_LEVEL=info
+    restart: unless-stopped
+    networks:
+      - sql-proxy-network
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "3306"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
+
+networks:
+  sql-proxy-network:
+    driver: bridge

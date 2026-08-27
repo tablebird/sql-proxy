@@ -1,0 +1,26 @@
+mysql_server:
+  addr: "127.0.0.1:3306"
+  user: "root"
+  password: "123456"
+
+backend:
+  # sqlpara 平台基础地址
+  base_url: "https://sqlpara.example.com"
+
+  #代理
+  proxy_url: 
+
+  # sqlpara 平台登录账号（对应接口 1 POST /authenticate）
+  username: "root"
+  password: "123456"
+
+  timeout: 30
+  max_retries: 3
+
+  # 额外自定义请求头
+  headers:
+    # X-Custom-Header: "custom-value"
+
+log:
+  level: "info"
+  format: "text"
