@@ -63,15 +63,13 @@ type Client interface {
 func NewClient(cfg *config.BackendConfig) Client {
 	jar, _ := cookiejar.New(nil)
 
-	var transport *http.Transport
+	transport := &http.Transport{}
 	if cfg.ProxyUrl != "" {
 		proxyUrl, err := url.Parse(cfg.ProxyUrl)
 		if err != nil {
 			logrus.WithError(err).Error("Failed to parse proxy URL")
 		} else {
-			transport = &http.Transport{
-				Proxy: http.ProxyURL(proxyUrl),
-			}
+			transport.Proxy = http.ProxyURL(proxyUrl)
 		}
 	}
 	return &sqlParaClient{
