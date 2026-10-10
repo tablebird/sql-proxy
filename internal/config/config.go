@@ -15,6 +15,7 @@ import (
 type Config struct {
 	MySQLServer MySQLServerConfig `mapstructure:"mysql_server"`
 	Backend     BackendConfig     `mapstructure:"backend"`
+	Redis       RedisConfig       `mapstructure:"redis"`
 	Log         LogConfig         `mapstructure:"log"`
 }
 
@@ -27,16 +28,24 @@ type MySQLServerConfig struct {
 }
 
 type BackendConfig struct {
-	BaseURL    string            `mapstructure:"base_url"`
-	Username   string            `mapstructure:"username"`
-	Password   string            `mapstructure:"password"`
-	Timeout    int               `mapstructure:"timeout"`
-	Headers    map[string]string `mapstructure:"headers"`
-	MaxRetries int               `mapstructure:"max_retries"`
-	ProxyUrl   string            `mapstructure:"proxy_url"`
+	BaseURL           string            `mapstructure:"base_url"`
+	Username          string            `mapstructure:"username"`
+	Password          string            `mapstructure:"password"`
+	Timeout           int               `mapstructure:"timeout"`
+	Headers           map[string]string `mapstructure:"headers"`
+	MaxRetries        int               `mapstructure:"max_retries"`
+	ProxyUrl          string            `mapstructure:"proxy_url"`
+	AuthReuseInterval time.Duration     `mapstructure:"auth_reuse_interval"`
 
 	DeprecatedURL string `mapstructure:"url"`
 	DeprecatedKey string `mapstructure:"api_key"`
+}
+
+type RedisConfig struct {
+	Host     string `mapstructure:"host"`
+	Port     int    `mapstructure:"port"`
+	Password string `mapstructure:"password"`
+	DB       int    `mapstructure:"db"`
 }
 
 type LogConfig struct {
@@ -57,6 +66,8 @@ func Load(path string) error {
 	viper.SetDefault("mysql_server.password", "")
 
 	viper.SetDefault("backend.base_url", "https://sqlpara.example.com")
+	viper.SetDefault("backend.auth_reuse_interval", 30*time.Minute)
+	viper.SetDefault("backend.password", "")
 	viper.SetDefault("backend.timeout", 30)
 	viper.SetDefault("backend.max_retries", 3)
 

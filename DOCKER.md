@@ -98,7 +98,8 @@ docker-compose logs -f sql-proxy
 ## 镜像优化
 
 Dockerfile 使用多阶段构建：
-- **构建阶段**：使用 golang:1.21-alpine 编译应用
+
+- **构建阶段**：使用 golang:1.26-alpine 编译应用
 - **运行阶段**：使用 alpine:latest 轻量级镜像运行，减小最终镜像大小
 
 最终镜像大小通常在 20-30MB 左右。

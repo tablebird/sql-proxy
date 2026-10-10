@@ -14,12 +14,19 @@ backend:
   username: "root"
   password: "123456"
 
+  auth_reuse_interval: 30m
+
   timeout: 30
   max_retries: 3
 
   # 额外自定义请求头
   headers:
     # X-Custom-Header: "custom-value"
+redis:
+  host: "" # "127.0.0.1:6379"
+  port: 6379
+  password: ""
+  db: 0
 
 log:
   level: "info"

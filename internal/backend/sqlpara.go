@@ -3,6 +3,8 @@ package backend
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +13,7 @@ import (
 	"net/http/cookiejar"
 	"net/url"
 	"sql-proxy/internal/config"
+	"sql-proxy/internal/store"
 	"strings"
 	"sync"
 	"time"
@@ -95,9 +98,10 @@ type sqlSubmitResponse struct {
 }
 
 type sqlParaClient struct {
-	cfg        *config.BackendConfig
-	httpClient *http.Client
-	cookieJar  *cookiejar.Jar
+	cfg         *config.BackendConfig
+	httpClient  *http.Client
+	cookieJar   *cookiejar.Jar
+	cookieStore store.CookieStore
 
 	mu            sync.Mutex
 	authenticated bool
@@ -122,7 +126,7 @@ func (c *sqlParaClient) Retries(ctx context.Context, fu func() (*SQLResponse, er
 			lastErr = err
 			lastResp = resp
 			if isAuthErrorType(err) {
-				c.invalidateAuth()
+				c.invalidateAuth(ctx)
 				continue
 			}
 			logrus.Warnf("request failed (attempt %d): %v", attempt+1, err)
@@ -383,8 +387,6 @@ func convertRawMapRows(rows []map[string]interface{}) *SQLResponse {
 // 认证
 // ------------------------------------------------------------------
 
-const authReuseInterval = 30 * time.Minute
-
 func (c *sqlParaClient) authenticate(ctx context.Context) error {
 
 	if _, _, err := c.doGetAllowHTML(ctx, c.cfg.BaseURL+"/login/"); err != nil {
@@ -431,12 +433,61 @@ func (c *sqlParaClient) authenticate(ctx context.Context) error {
 		return fmt.Errorf("authenticate did not set session cookie, check credentials or CSRF headers")
 	}
 
+	if err := c.saveCookies(ctx); err != nil {
+		logrus.Warnf("save sqlpara cookies to store failed: %v", err)
+	}
+
 	c.mu.Lock()
 	c.authenticated = true
-	c.authExpiresAt = time.Now().Add(authReuseInterval)
+	c.authExpiresAt = time.Now().Add(c.cfg.AuthReuseInterval)
 	c.mu.Unlock()
 	logrus.Infof("authenticated to sqlpara as %s", c.cfg.Username)
 	return nil
+}
+
+func (c *sqlParaClient) cookieStoreKey() string {
+	sum := sha256.Sum256([]byte(c.cfg.BaseURL + "\x00" + c.cfg.Username))
+	return "sql-proxy:sqlpara:cookie:" + hex.EncodeToString(sum[:])
+}
+
+func (c *sqlParaClient) saveCookies(ctx context.Context) error {
+	if c.cookieStore == nil {
+		return fmt.Errorf("cookieStore is nil")
+	}
+
+	u, err := url.Parse(c.cfg.BaseURL)
+	if err != nil {
+		return err
+	}
+	data, err := json.Marshal(c.cookieJar.Cookies(u))
+	if err != nil {
+		return err
+	}
+	return c.cookieStore.Set(ctx, c.cookieStoreKey(), data, c.cfg.AuthReuseInterval)
+}
+
+func (c *sqlParaClient) restoreCookies(ctx context.Context) (bool, error) {
+	if c.cookieStore == nil {
+		return false, fmt.Errorf("cookieStore is nil")
+	}
+
+	data, found, err := c.cookieStore.Get(ctx, c.cookieStoreKey())
+	if err != nil || !found {
+		return false, err
+	}
+
+	var cookies []*http.Cookie
+	if err := json.Unmarshal(data, &cookies); err != nil {
+		_ = c.cookieStore.Delete(ctx, c.cookieStoreKey())
+		return false, err
+	}
+
+	u, err := url.Parse(c.cfg.BaseURL)
+	if err != nil {
+		return false, err
+	}
+	c.cookieJar.SetCookies(u, cookies)
+	return c.hasSessionCookie(), nil
 }
 
 func (c *sqlParaClient) hasSessionCookie() bool {
@@ -462,16 +513,35 @@ func (c *sqlParaClient) ensureAuthenticated(ctx context.Context) error {
 	if ok {
 		return nil
 	}
+	if !c.hasSessionCookie() {
+		restored, err := c.restoreCookies(ctx)
+		if err != nil {
+			logrus.Warnf("restore sqlpara cookies from store failed: %v", err)
+		}
+		if restored {
+			logrus.Debug("restored sqlpara cookies from store, skipping re-authentication")
+			c.mu.Lock()
+			c.authenticated = true
+			c.authExpiresAt = time.Now().Add(c.cfg.AuthReuseInterval)
+			c.mu.Unlock()
+			return nil
+		}
+	}
 	return c.authenticate(ctx)
 }
 
-func (c *sqlParaClient) invalidateAuth() {
+func (c *sqlParaClient) invalidateAuth(ctx context.Context) {
 	c.mu.Lock()
 	c.authenticated = false
 	c.mu.Unlock()
 	if c.cookieJar != nil {
 		if u, err := url.Parse(c.cfg.BaseURL); err == nil {
 			c.cookieJar.SetCookies(u, nil)
+		}
+	}
+	if c.cookieStore != nil {
+		if err := c.cookieStore.Delete(ctx, c.cookieStoreKey()); err != nil {
+			logrus.Warnf("delete sqlpara cookies from store failed: %v", err)
 		}
 	}
 }

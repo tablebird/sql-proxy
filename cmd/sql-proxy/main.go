@@ -9,6 +9,7 @@ import (
 	"sql-proxy/internal/backend"
 	"sql-proxy/internal/config"
 	"sql-proxy/internal/proxy"
+	"sql-proxy/internal/store"
 
 	"github.com/sirupsen/logrus"
 )
@@ -22,6 +23,8 @@ func main() {
 	}
 
 	logrus.Info("starting sql-proxy...")
+
+	store.InitRedis(&config.AppConfig.Redis)
 
 	backendClient := backend.NewClient(&config.AppConfig.Backend)
 

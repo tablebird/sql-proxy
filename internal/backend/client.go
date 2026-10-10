@@ -9,6 +9,7 @@ import (
 
 	"sql-proxy/internal/config"
 	"sql-proxy/internal/sql"
+	"sql-proxy/internal/store"
 
 	"github.com/sirupsen/logrus"
 )
@@ -99,6 +100,7 @@ func NewClient(cfg *config.BackendConfig) Client {
 			Timeout:   time.Duration(cfg.Timeout) * time.Second,
 			Jar:       jar,
 		},
-		cookieJar: jar,
+		cookieJar:   jar,
+		cookieStore: store.NewRedisCookieStore(),
 	}
 }
