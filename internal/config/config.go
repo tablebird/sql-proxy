@@ -3,6 +3,8 @@ package config
 import (
 	"fmt"
 	"os"
+	"sql-proxy/internal/log"
+	"time"
 
 	. "github.com/go-mysql-org/go-mysql/mysql"
 
@@ -95,8 +97,12 @@ func setupLog() error {
 	case "json":
 		logrus.SetFormatter(&logrus.JSONFormatter{})
 	default:
-		logrus.SetFormatter(&logrus.TextFormatter{
-			FullTimestamp: true,
+		logrus.SetFormatter(&log.CustomFormatter{
+			StartTime: time.Now(),
+			TextFormatter: logrus.TextFormatter{
+				DisableColors: false, // 是否关闭颜色
+				FullTimestamp: false,
+			},
 		})
 	}
 

@@ -1,10 +1,14 @@
 package proxy
 
 import (
+	"errors"
 	"fmt"
+	"io"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 
 	"sql-proxy/internal/backend"
 	"sql-proxy/internal/config"
@@ -64,7 +68,9 @@ func (s *Server) handleConnection(conn net.Conn) {
 	defer conn.Close()
 
 	connID := atomic.AddUint32(&s.connID, 1)
-	logrus.Infof("[conn %d] new connection from %s", connID, conn.RemoteAddr())
+	remoteAddr := conn.RemoteAddr()
+
+	logrus.Debugf("[conn %d] new connection from %s", connID, remoteAddr)
 
 	handler := NewHandler(s.backend, connID)
 
@@ -78,7 +84,11 @@ func (s *Server) handleConnection(conn net.Conn) {
 
 	connHandler, err := config.NewCustomizedConn(conn, p, handler)
 	if err != nil {
-		logrus.Errorf("[conn %d] create connection handler error: %v", connID, err)
+		if isExpectedProbeError(remoteAddr.String(), err) {
+			logrus.Debugf("[conn %d] client disconnected before MySQL handshake: %v", connID, err)
+		} else {
+			logrus.Warnf("[conn %d] create connection handler error: %v", connID, err)
+		}
 		return
 	}
 
@@ -86,7 +96,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 
 	handler.setAttributes(attrs)
 
-	logrus.Infof("[conn %d] authenticated: user=%s", connID, s.cfg.User)
+	logrus.Infof("[conn %d] authenticated: user=%s from %s", connID, s.cfg.User, remoteAddr)
 
 	for {
 		if s.stopped.Load() {
@@ -101,6 +111,16 @@ func (s *Server) handleConnection(conn net.Conn) {
 			return
 		}
 	}
+}
+
+func isExpectedProbeError(address string, err error) bool {
+	if strings.HasPrefix(address, "127.0.0.1") {
+		return true
+	}
+	return strings.Contains(err.Error(), "err EOF") || errors.Is(err, io.EOF) ||
+		errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, syscall.ECONNRESET) ||
+		errors.Is(err, syscall.EPIPE)
 }
 
 func (s *Server) Stop() error {
