@@ -1,6 +1,7 @@
 package backend
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -53,6 +54,46 @@ type sqlQueryData struct {
 	PrivCheck           *bool           `json:"priv_check"`
 }
 
+type sqlCheckResponse struct {
+	IsExecute    bool        `json:"is_execute"`
+	Checked      string      `json:"checked"`
+	Warning      interface{} `json:"warning"`
+	Error        interface{} `json:"error"`
+	WarningCount int64       `json:"warning_count"`
+	ErrorCount   int64       `json:"error_count"`
+	IsCritical   bool        `json:"is_critical"`
+	SyntaxType   int64       `json:"syntax_type"`
+	Rows         []checkRow  `json:"rows"`
+	ColumnList   []string    `json:"column_list"`
+	Status       interface{} `json:"status"`
+	AffectedRows int64       `json:"affected_rows"`
+}
+
+type checkRow struct {
+	ID                 int64  `json:"id"`
+	Stage              string `json:"stage"`
+	Errlevel           int64  `json:"errlevel"`
+	Stagestatus        string `json:"stagestatus"`
+	Errormessage       string `json:"errormessage"`
+	SQL                string `json:"sql"`
+	AffectedRows       int64  `json:"affected_rows"`
+	Sequence           string `json:"sequence"`
+	BackupDbname       string `json:"backup_dbname"`
+	ExecuteTime        string `json:"execute_time"`
+	Sqlsha1            string `json:"sqlsha1"`
+	BackupTime         string `json:"backup_time"`
+	ActualAffectedRows string `json:"actual_affected_rows"`
+}
+
+type sqlSubmitResponse struct {
+	ID            int             `json:"id"`
+	WorkflowID    int             `json:"workflow_id"`
+	Workflow      json.RawMessage `json:"workflow"` // workflow原始json，动态结构
+	SqlContent    json.RawMessage `json:"sql_content"`
+	ReviewContent json.RawMessage `json:"review_content"`
+	ExecuteResult json.RawMessage `json:"execute_result"`
+}
+
 type sqlParaClient struct {
 	cfg        *config.BackendConfig
 	httpClient *http.Client
@@ -63,10 +104,7 @@ type sqlParaClient struct {
 	authExpiresAt time.Time
 }
 
-func (c *sqlParaClient) Execute(ctx context.Context, req *SQLRequest) (*SQLResponse, error) {
-	db := req.Database
-	instance := req.InstanceName
-
+func (c *sqlParaClient) Retries(ctx context.Context, fu func() (*SQLResponse, error)) (*SQLResponse, error) {
 	var lastErr error
 	var lastResp *SQLResponse
 	for attempt := 0; attempt <= c.cfg.MaxRetries; attempt++ {
@@ -75,7 +113,11 @@ func (c *sqlParaClient) Execute(ctx context.Context, req *SQLRequest) (*SQLRespo
 			logrus.Debugf("retry query, attempt %d/%d", attempt, c.cfg.MaxRetries)
 		}
 
-		resp, err := c.doSQLExecute(ctx, req.SQL, req.Args, instance, db)
+		if err := c.ensureAuthenticated(ctx); err != nil {
+			return nil, err
+		}
+
+		resp, err := fu()
 		if err != nil {
 			lastErr = err
 			lastResp = resp
@@ -84,7 +126,7 @@ func (c *sqlParaClient) Execute(ctx context.Context, req *SQLRequest) (*SQLRespo
 				continue
 			}
 			logrus.Warnf("request failed (attempt %d): %v", attempt+1, err)
-			continue
+			break
 		}
 		return resp, nil
 	}
@@ -95,29 +137,143 @@ func (c *sqlParaClient) Execute(ctx context.Context, req *SQLRequest) (*SQLRespo
 	return nil, fmt.Errorf("all retries failed: %w", lastErr)
 }
 
-func (c *sqlParaClient) Query(ctx context.Context, sql string, args ...interface{}) (*SQLResponse, error) {
-	return c.Execute(ctx, &SQLRequest{
-		SQL:  sql,
-		Args: args,
+func (c *sqlParaClient) Execute(ctx context.Context, req *SQLRequest) (*SQLResponse, error) {
+	return c.Retries(ctx, func() (*SQLResponse, error) {
+		return c.doSQLExecute(ctx, req)
 	})
+}
+
+func (c *sqlParaClient) PreSubmit(ctx context.Context, req *SQLRequest) error {
+	_, err := c.Retries(ctx, func() (*SQLResponse, error) {
+		return nil, c.doSQLPreSubmit(ctx, req)
+	})
+	return err
+}
+
+func (c *sqlParaClient) Submit(ctx context.Context, req *SQLRequest) (*SQLResponse, error) {
+	return c.Retries(ctx, func() (*SQLResponse, error) {
+		return c.doSQLSubmit(ctx, req)
+	})
+}
+
+func (c *sqlParaClient) doSQLPreSubmit(ctx context.Context, req *SQLRequest) error {
+	sql := req.InterpolateSQL()
+
+	metadata := req.Metadata
+	if metadata == nil {
+		return errors.New("metadata is empty")
+	}
+
+	db_name, dbOk := metadata["db_name"].(string)
+	instance_id, IdOk := metadata["instance_id"].(string)
+	if !dbOk || !IdOk || db_name == "" || instance_id == "" {
+		return errors.New("[db/instance_id] is empty or type not string")
+	}
+
+	body := map[string]string{
+		"db_name":     db_name,
+		"instance_id": instance_id,
+		"full_sql":    sql,
+	}
+	bytes, err := json.Marshal(body)
+	if err != nil {
+		return err
+	}
+	u := strings.TrimRight(c.cfg.BaseURL, "/") + "/api/v1/workflow/sqlcheck/"
+	httpResp, respBody, err := c.doJsonPost(ctx, u, bytes)
+
+	if err != nil {
+		return err
+	}
+	_ = httpResp
+
+	var apiResp sqlCheckResponse
+	if err := json.Unmarshal(respBody, &apiResp); err != nil {
+		return fmt.Errorf("parse response: %w, body: %s", err, truncateString(string(respBody), 500))
+	}
+
+	if apiResp.ErrorCount > 0 {
+		errors := make([]string, 0, apiResp.ErrorCount)
+		rows := apiResp.Rows
+		for i := range rows {
+			item := rows[i]
+			if item.Errlevel > 1 {
+				msg := fmt.Sprintf("[%s] %s", item.SQL, item.Errormessage)
+				errors = append(errors, msg)
+			}
+		}
+		return fmt.Errorf("SQL syntax error: %s", strings.Join(errors, "\n"))
+	}
+	return nil
+}
+
+func (c *sqlParaClient) doSQLSubmit(ctx context.Context, req *SQLRequest) (*SQLResponse, error) {
+	sql := req.InterpolateSQL()
+
+	metadata := req.Metadata
+	if metadata == nil {
+		return nil, errors.New("metadata is empty")
+	}
+	db_name, dbOk := metadata["db_name"].(string)
+	instance_id, IdOk := metadata["instance_id"].(string)
+	workflow_name, workflowOk := metadata["workflow_name"].(string)
+	group_id, groupOk := metadata["group_id"].(string)
+	is_backup, _ := metadata["is_backup"].(bool)
+	run_date_start, _ := metadata["run_date_start"].(string)
+	run_date_end, _ := metadata["run_date_end"].(string)
+	if !dbOk || !IdOk || !workflowOk || !groupOk || db_name == "" || instance_id == "" || workflow_name == "" || group_id == "" {
+		return nil, errors.New("[db/instance_id/workflow_name/group_id] is empty or type not string")
+	}
+	workflow := map[string]any{
+		"workflow_name":  workflow_name,
+		"group_id":       group_id,
+		"db_name":        db_name,
+		"is_backup":      is_backup,
+		"instance":       instance_id,
+		"run_date_start": run_date_start,
+		"run_date_end":   run_date_end,
+	}
+	body := map[string]any{
+		"workflow":    workflow,
+		"sql_content": sql,
+	}
+
+	bytes, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	u := strings.TrimRight(c.cfg.BaseURL, "/") + "/api/v1/workflow/"
+	httpResp, respBody, err := c.doJsonPost(ctx, u, bytes)
+
+	if err != nil {
+		return nil, err
+	}
+
+	if httpResp.StatusCode != 201 {
+		return nil, fmt.Errorf("status code: %d", httpResp.StatusCode)
+	}
+
+	var resp sqlSubmitResponse
+	if err := json.Unmarshal(respBody, &resp); err != nil {
+		return nil, fmt.Errorf("parse response: %w, body: %s", err, truncateString(string(respBody), 500))
+	}
+
+	return &SQLResponse{
+		Success: true,
+		Message: string(resp.Workflow),
+	}, nil
 }
 
 // ------------------------------------------------------------------
 // 核心：SQL 执行（与接口 5 同结构）
 // ------------------------------------------------------------------
 
-func (c *sqlParaClient) doSQLExecute(ctx context.Context, sql string, args []interface{}, instanceName string, db string) (*SQLResponse, error) {
-	if err := c.ensureAuthenticated(ctx); err != nil {
-		return nil, err
-	}
-
-	if len(args) > 0 {
-		sql = interpolateSQL(sql, args)
-	}
+func (c *sqlParaClient) doSQLExecute(ctx context.Context, req *SQLRequest) (*SQLResponse, error) {
+	sql := req.InterpolateSQL()
 
 	form := url.Values{}
-	form.Set("instance_name", instanceName)
-	form.Set("db_name", db)
+	form.Set("instance_name", req.InstanceName)
+	form.Set("db_name", req.Database)
 	form.Set("schema_name", "")
 	form.Set("tb_name", "")
 	form.Set("sql_content", sql)
@@ -136,7 +292,7 @@ func (c *sqlParaClient) doSQLExecute(ctx context.Context, sql string, args []int
 		return nil, fmt.Errorf("parse response: %w, body: %s", err, truncateString(string(respBody), 500))
 	}
 	if apiResp.Status != 0 {
-		return &SQLResponse{Success: false, Error: apiResp.Msg},
+		return &SQLResponse{Success: false, Message: apiResp.Msg},
 			fmt.Errorf("sqlpara api status=%d msg=%s", apiResp.Status, apiResp.Msg)
 	}
 
@@ -170,7 +326,7 @@ func (c *sqlParaClient) convertQueryData(qd *sqlQueryData) *SQLResponse {
 	// 错误判断
 	if qd.ErrorMsg != nil && *qd.ErrorMsg != "" {
 		resp.Success = false
-		resp.Error = *qd.ErrorMsg
+		resp.Message = *qd.ErrorMsg
 	}
 
 	// 结果集
@@ -410,6 +566,15 @@ func (c *sqlParaClient) doGetAllowHTML(ctx context.Context, u string) (*http.Res
 	return c.do(req, u, true)
 }
 
+func (c *sqlParaClient) doJsonPost(ctx context.Context, u string, body []byte) (*http.Response, []byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, bytes.NewReader(body))
+	if err != nil {
+		return nil, nil, fmt.Errorf("build POST request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	return c.do(req, u, false)
+}
+
 func (c *sqlParaClient) doFormPost(ctx context.Context, u string, form url.Values) (*http.Response, []byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, strings.NewReader(form.Encode()))
 	if err != nil {
@@ -490,87 +655,4 @@ func truncateString(s string, maxLen int) string {
 		return s
 	}
 	return s[:maxLen] + "..."
-}
-
-func interpolateSQL(sql string, args []interface{}) string {
-	var b strings.Builder
-	argIdx := 0
-	runes := []rune(sql)
-	for i := 0; i < len(runes); i++ {
-		r := runes[i]
-		if r == '?' && argIdx < len(args) {
-			b.WriteString(formatArg(args[argIdx]))
-			argIdx++
-			continue
-		}
-		if r == '\'' || r == '"' {
-			quote := r
-			b.WriteRune(r)
-			i++
-			for i < len(runes) {
-				c := runes[i]
-				b.WriteRune(c)
-				if c == '\\' && i+1 < len(runes) {
-					b.WriteRune(runes[i+1])
-					i += 2
-					continue
-				}
-				if c == quote {
-					break
-				}
-				i++
-			}
-			continue
-		}
-		b.WriteRune(r)
-	}
-	return b.String()
-}
-
-func formatArg(v interface{}) string {
-	if v == nil {
-		return "NULL"
-	}
-	switch x := v.(type) {
-	case string:
-		return "'" + escapeString(x) + "'"
-	case []byte:
-		return "'" + escapeString(string(x)) + "'"
-	case bool:
-		if x {
-			return "1"
-		}
-		return "0"
-	case int, int8, int16, int32, int64,
-		uint, uint8, uint16, uint32, uint64,
-		float32, float64:
-		return fmt.Sprintf("%v", x)
-	default:
-		return "'" + escapeString(fmt.Sprintf("%v", x)) + "'"
-	}
-}
-
-func escapeString(s string) string {
-	var b strings.Builder
-	for _, r := range s {
-		switch r {
-		case '\'':
-			b.WriteString("''")
-		case '\\':
-			b.WriteString("\\\\")
-		case '\n':
-			b.WriteString("\\n")
-		case '\r':
-			b.WriteString("\\r")
-		case '\t':
-			b.WriteString("\\t")
-		case '\x00':
-			b.WriteString("\\0")
-		case '\x1a':
-			b.WriteString("\\Z")
-		default:
-			b.WriteRune(r)
-		}
-	}
-	return b.String()
 }

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"sql-proxy/internal/config"
+	"sql-proxy/internal/sql"
 
 	"github.com/sirupsen/logrus"
 )
@@ -17,20 +18,35 @@ import (
 // ------------------------------------------------------------------
 
 type SQLRequest struct {
-	SQL          string        `json:"sql"`
-	Args         []interface{} `json:"args,omitempty"`
-	InstanceName string        `json:"instance_name,omitempty"`
-	Database     string        `json:"database,omitempty"`
-	MaxRows      int           `json:"max_rows,omitempty"`
-	TimeoutMs    int           `json:"timeout_ms,omitempty"`
+	SQL          string         `json:"sql"`
+	Metadata     map[string]any `json:"metadata,omitempty"`
+	Args         []interface{}  `json:"args,omitempty"`
+	InstanceName string         `json:"instance_name,omitempty"`
+	Database     string         `json:"database,omitempty"`
+	MaxRows      int            `json:"max_rows,omitempty"`
+	TimeoutMs    int            `json:"timeout_ms,omitempty"`
+}
+
+func (r *SQLRequest) InterpolateSQL() string {
+	if len(r.Args) > 0 {
+		return sql.InterpolateSQL(r.SQL, r.Args)
+	}
+	return r.SQL
 }
 
 type SQLResponse struct {
 	Success      bool           `json:"success"`
-	Error        string         `json:"error,omitempty"`
+	Message      string         `json:"message,omitempty"`
 	Results      []*QueryResult `json:"results,omitempty"`
 	RowCount     int64          `json:"row_count,omitempty"`
 	LastInsertID int64          `json:"last_insert_id,omitempty"`
+}
+
+func (r *SQLResponse) Error() string {
+	if r.Success {
+		return ""
+	}
+	return r.Message
 }
 
 type QueryResult struct {
@@ -56,6 +72,10 @@ type DBInstance struct {
 
 type Client interface {
 	Execute(ctx context.Context, req *SQLRequest) (*SQLResponse, error)
+
+	PreSubmit(ctx context.Context, req *SQLRequest) error
+
+	Submit(ctx context.Context, req *SQLRequest) (*SQLResponse, error)
 
 	ListDatabases(ctx context.Context, instanceName string) ([]string, error)
 }

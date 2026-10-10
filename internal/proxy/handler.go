@@ -7,13 +7,10 @@ import (
 	"strings"
 
 	"sql-proxy/internal/backend"
+	"sql-proxy/internal/sql"
 
 	"github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/server"
-
-	"github.com/pingcap/tidb/pkg/parser"
-	"github.com/pingcap/tidb/pkg/parser/format"
-	_ "github.com/pingcap/tidb/pkg/parser/test_driver"
 
 	"github.com/sirupsen/logrus"
 )
@@ -65,28 +62,50 @@ func (h *Handler) HandleQuery(query string) (*mysql.Result, error) {
 	logrus.Infof("[conn %d] Query: %s", h.connID, truncateQuery(query))
 	ctx := context.Background()
 
-	q, err := stripLeadingComments(query)
+	result, err := sql.ParseClientSQL(query)
 	if err != nil {
 		return nil, mysql.NewError(ERUnknownError, err.Error())
 	}
 
-	qType := classifyQuery(q)
+	qType := classifyQuery(result.CleanSQL)
 
 	switch qType {
 	case QueryTypeShow:
-		return h.handleShowQuery(ctx, q)
+		return h.handleShowQuery(ctx, result.CleanSQL)
 	case QueryTypeUse:
-		h.UseDB(strings.TrimPrefix(q, "USE "))
+		h.UseDB(strings.TrimPrefix(result.CleanSQL, "USE "))
 		return h.buildEmptyOK()
 	case QueryTypeSet:
 		return h.buildEmptyOK()
 	case QueryTypeBegin, QueryTypeCommit, QueryTypeRollback:
 		return h.buildEmptyOK()
 	case QueryTypeSelect:
-		return h.handleSelectQuery(ctx, q)
+		return h.handleSelectQuery(ctx, result.CleanSQL)
+	case QueryTypeUpdate, QueryTypeInsert, QueryTypeDelete:
+		return h.handleSubmit(ctx, result)
 	default:
 		return h.buildEmptyOK()
 	}
+}
+
+func (h *Handler) handleSubmit(ctx context.Context, result *sql.ParseResult) (*mysql.Result, error) {
+	err := h.backend.PreSubmit(ctx, &backend.SQLRequest{
+		SQL:      result.CleanSQL,
+		Metadata: result.Metadata,
+	})
+	if err != nil {
+		return nil, mysql.NewError(ERUnknownError, err.Error())
+	}
+	resp, err := h.backend.Submit(ctx, &backend.SQLRequest{
+		SQL:      result.CleanSQL,
+		Metadata: result.Metadata,
+	})
+	if err != nil {
+		return nil, mysql.NewError(ERUnknownError, err.Error())
+	}
+	return &mysql.Result{
+		StatusMessage: resp.Message,
+	}, nil
 }
 
 func (h *Handler) handleGenericQuery(ctx context.Context, query string) (*mysql.Result, error) {
@@ -96,8 +115,8 @@ func (h *Handler) handleGenericQuery(ctx context.Context, query string) (*mysql.
 		InstanceName: h.instanceName,
 	})
 	if err != nil {
-		if resp != nil && resp.Error != "" {
-			return nil, mysql.NewError(ERUnknownError, resp.Error)
+		if resp != nil && resp.Error() != "" {
+			return nil, mysql.NewError(ERUnknownError, resp.Error())
 		}
 		return nil, mysql.NewError(ERUnknownError, err.Error())
 	}
@@ -169,6 +188,8 @@ func (h *Handler) handleSelectQuery(ctx context.Context, query string) (*mysql.R
 	switch {
 	case regexp.MustCompile(`(?i)select.+from\s+mysql\.user\s+.+`).MatchString(query):
 		return h.buildEmptyOK()
+	case regexp.MustCompile(`(?i)^select\s+(@@SESSION.)?tx_read_only`).MatchString(query):
+		return h.buildTxReadOnlyResult()
 	default:
 		return h.handleGenericQuery(ctx, query)
 	}
@@ -222,6 +243,14 @@ func (h *Handler) buildVersionResult() (*mysql.Result, error) {
 	names := []string{"version()"}
 	rows := [][]any{
 		{"8.0.33-sql-proxy"},
+	}
+	return buildTextResult(names, rows)
+}
+
+func (h *Handler) buildTxReadOnlyResult() (*mysql.Result, error) {
+	names := []string{"tx_read_only"}
+	rows := [][]any{
+		{"0"},
 	}
 	return buildTextResult(names, rows)
 }
@@ -284,8 +313,8 @@ func (h *Handler) HandleStmtExecute(stmtContext interface{}, query string, args 
 		InstanceName: h.instanceName,
 	})
 	if err != nil {
-		if resp != nil && resp.Error != "" {
-			return nil, mysql.NewError(ERUnknownError, resp.Error)
+		if resp != nil && resp.Error() != "" {
+			return nil, mysql.NewError(ERUnknownError, resp.Error())
 		}
 		return nil, mysql.NewError(ERUnknownError, err.Error())
 	}
@@ -357,24 +386,6 @@ func countPlaceholders(query string) int {
 		}
 	}
 	return count
-}
-
-func stripLeadingComments(sql string) (string, error) {
-	p := parser.New()
-
-	stmt, err := p.ParseOneStmt(sql, "", "")
-	if err != nil {
-		return "", err
-	}
-	var buf strings.Builder
-	ctx := format.NewRestoreCtx(format.RestoreStringSingleQuotes|format.RestoreKeyWordUppercase, &buf)
-
-	err = stmt.Restore(ctx)
-
-	if err != nil {
-		return "", err
-	}
-	return buf.String(), nil
 }
 
 func truncateQuery(q string) string {
